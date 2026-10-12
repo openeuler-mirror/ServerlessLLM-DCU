@@ -7,6 +7,10 @@ project(storage LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 
 option(BUILD_SLLM_TESTS "Build tests" OFF)
+# Explicit GPU backend selection. When none is set, backends are auto-detected.
+option(USE_CUDA "Enable CUDA support" OFF)
+option(USE_ROCM "Enable ROCm support" OFF)
+option(USE_DTK "Enable Hygon DTK support" OFF)
 # Disable other tests
 set(BUILD_TESTING OFF)
 
@@ -26,22 +30,143 @@ set(FETCHCONTENT_QUIET OFF)
 FetchContent_MakeAvailable(glog)
 FetchContent_MakeAvailable(googletest)
 
-find_package(CUDAToolkit QUIET)
-find_package(HIP QUIET)
+# ---------------------------------------------------------------------------
+# Hygon DCU / DTK path configuration
+# ---------------------------------------------------------------------------
+
+set(SLLM_DTK_ROOT "")
+
+# First, use an explicitly configured DTK_HOME.
+if(DEFINED ENV{DTK_HOME} AND NOT "$ENV{DTK_HOME}" STREQUAL "")
+  set(SLLM_DTK_ROOT "$ENV{DTK_HOME}")
+
+# ROCM_HOME may also point to the DTK installation in a DCU environment.
+elseif(DEFINED ENV{ROCM_HOME} AND NOT "$ENV{ROCM_HOME}" STREQUAL "")
+  set(SLLM_DTK_ROOT "$ENV{ROCM_HOME}")
+
+# Fallback for the current Hygon DTK installation.
+elseif(EXISTS "/opt/dtk-26.04")
+  set(SLLM_DTK_ROOT "/opt/dtk-26.04")
+
+# Standard AMD ROCm fallback.
+elseif(EXISTS "/opt/rocm")
+  set(SLLM_DTK_ROOT "/opt/rocm")
+endif()
+
+if(SLLM_DTK_ROOT)
+  message(STATUS "GPU toolkit root: ${SLLM_DTK_ROOT}")
+
+  # Provide hints for find_package(HIP).
+  list(PREPEND CMAKE_PREFIX_PATH
+    "${SLLM_DTK_ROOT}"
+    "${SLLM_DTK_ROOT}/hip"
+    "${SLLM_DTK_ROOT}/lib/cmake"
+    "${SLLM_DTK_ROOT}/hip/lib/cmake"
+    "${SLLM_DTK_ROOT}/hip/lib64/cmake"
+  )
+
+  set(HIP_ROOT_DIR
+    "${SLLM_DTK_ROOT}"
+    CACHE PATH "HIP/DTK installation root")
+
+  # DTK installs amd_comgr under lib64/cmake.
+  if(EXISTS
+     "${SLLM_DTK_ROOT}/lib64/cmake/amd_comgr/amd_comgr-config.cmake")
+
+    set(
+      amd_comgr_DIR
+      "${SLLM_DTK_ROOT}/lib64/cmake/amd_comgr"
+      CACHE PATH "amd_comgr CMake package directory"
+      FORCE
+    )
+
+    message(STATUS
+      "amd_comgr package directory: ${amd_comgr_DIR}")
+  endif()
+endif()
+
+list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES
+  CMAKE_PREFIX_PATH
+  HIP_ROOT_DIR
+  amd_comgr_DIR
+)
 
 # set CUDA or HIP
-if (CUDAToolkit_FOUND)
-  message(STATUS "CUDA found")
-  set(CUDA_SUPPORTED_ARCHS "7.0;7.5;8.0;8.6;8.9;9.0")
-  set(SLLM_STORE_GPU_LANG "CUDA")
-  enable_language(CUDA)
-elseif (HIP_FOUND)
-  message(STATUS "HIP found")
-  set(HIP_SUPPORTED_ARCHS "gfx906;gfx908;gfx90a;gfx940;gfx941;gfx942;gfx1030;gfx1100")
-  set(SLLM_STORE_GPU_LANG "HIP")
-  enable_language(HIP)
+if (USE_CUDA)
+  find_package(CUDAToolkit QUIET)
+  if (CUDAToolkit_FOUND)
+    message(STATUS "CUDA found")
+    set(CUDA_SUPPORTED_ARCHS "7.0;7.5;8.0;8.6;8.9;9.0")
+    set(SLLM_STORE_GPU_LANG "CUDA")
+    enable_language(CUDA)
+  else()
+    message(FATAL_ERROR "CUDA backend was requested but the CUDA toolkit was not found")
+  endif()
+elseif (USE_ROCM OR USE_DTK)
+  if (USE_ROCM)
+    add_definitions(-DUSE_ROCM)
+    message(STATUS "ROCm/HIP backend explicitly enabled")
+  else()
+    add_definitions(-DUSE_DTK)
+    message(STATUS "Hygon DTK/HIP backend explicitly enabled")
+  endif()
+
+  # Locate hipcc/dcc for diagnostic purposes.
+  find_program(SLLM_HIP_COMPILER_DRIVER
+    NAMES hipcc dcc
+    HINTS
+      "${SLLM_DTK_ROOT}/bin"
+      "${SLLM_DTK_ROOT}/hip/bin"
+      "${SLLM_DTK_ROOT}/llvm/bin"
+  )
+
+  if(SLLM_HIP_COMPILER_DRIVER)
+    message(STATUS
+      "HIP compiler driver found: ${SLLM_HIP_COMPILER_DRIVER}")
+  else()
+    message(FATAL_ERROR
+      "Neither hipcc nor dcc was found. "
+      "Please check DTK_HOME, ROCM_HOME and PATH.")
+  endif()
+
+  find_package(HIP QUIET)
+
+  if (HIP_FOUND)
+    message(STATUS "HIP package found")
+    set(SLLM_STORE_GPU_LANG "HIP")
+    enable_language(HIP)
+
+    if(CMAKE_HIP_COMPILER)
+      message(STATUS "CMake HIP compiler: ${CMAKE_HIP_COMPILER}")
+    endif()
+
+    if(CMAKE_HIP_ARCHITECTURES)
+      message(STATUS
+        "Detected HIP architectures: ${CMAKE_HIP_ARCHITECTURES}")
+    endif()
+  else()
+    message(FATAL_ERROR
+      "HIP package was not found under ${SLLM_DTK_ROOT}. "
+      "Check the DTK installation and CMAKE_PREFIX_PATH.")
+  endif()
 else()
-  message(FATAL_ERROR "Neither CUDA nor HIP found")
+  find_package(CUDAToolkit QUIET)
+  find_package(HIP QUIET)
+
+  # set CUDA or HIP
+  if (CUDAToolkit_FOUND)
+    message(STATUS "CUDA found")
+    set(CUDA_SUPPORTED_ARCHS "7.0;7.5;8.0;8.6;8.9;9.0")
+    set(SLLM_STORE_GPU_LANG "CUDA")
+    enable_language(CUDA)
+  elseif (HIP_FOUND)
+    message(STATUS "HIP found")
+    set(HIP_SUPPORTED_ARCHS "gfx906;gfx908;gfx90a;gfx940;gfx941;gfx942;gfx1030;gfx1100")
+    set(SLLM_STORE_GPU_LANG "HIP")
+    enable_language(HIP)
+  else()
+    message(FATAL_ERROR "Neither CUDA nor HIP found")
+  endif()
 endif()
 
 
@@ -93,13 +218,51 @@ find_library(torch_python_LIBRARY torch_python PATHS
   "${TORCH_INSTALL_PREFIX}/lib")
 
 #
-# Override the GPU architectures detected by cmake/torch and filter them by
-# the supported versions for the current language.
-# The final set of arches is stored in `SLLM_STORE_GPU_ARCHES`.
+# Configure the GPU architectures for the current language.
 #
-override_gpu_arches(SLLM_STORE_GPU_ARCHES
-${SLLM_STORE_GPU_LANG}
-"${${SLLM_STORE_GPU_LANG}_SUPPORTED_ARCHS}")
+if(SLLM_STORE_GPU_LANG STREQUAL "HIP")
+  # Do not filter Hygon DCU architectures through the upstream AMD gfx list.
+  # Prefer an explicitly configured architecture.
+  if(DEFINED ENV{PYTORCH_ROCM_ARCH}
+    AND NOT "$ENV{PYTORCH_ROCM_ARCH}" STREQUAL "")
+
+    set(SLLM_STORE_GPU_ARCHES "$ENV{PYTORCH_ROCM_ARCH}")
+
+    # Allow comma-separated or space-separated values.
+    string(REPLACE "," ";"
+      SLLM_STORE_GPU_ARCHES "${SLLM_STORE_GPU_ARCHES}")
+    string(REPLACE " " ";"
+      SLLM_STORE_GPU_ARCHES "${SLLM_STORE_GPU_ARCHES}")
+
+    message(STATUS
+      "HIP architectures from PYTORCH_ROCM_ARCH: "
+      "${SLLM_STORE_GPU_ARCHES}")
+
+  elseif(CMAKE_HIP_ARCHITECTURES)
+    set(SLLM_STORE_GPU_ARCHES "${CMAKE_HIP_ARCHITECTURES}")
+
+    message(STATUS
+      "Using CMake-detected HIP architectures: "
+      "${SLLM_STORE_GPU_ARCHES}")
+
+  else()
+    # Leave it empty and let the DTK compiler select its default architecture.
+    set(SLLM_STORE_GPU_ARCHES "")
+
+    message(WARNING
+      "No explicit HIP architecture was detected. "
+      "The DTK compiler default will be used.")
+  endif()
+else()
+  #
+  # Override the GPU architectures detected by cmake/torch and filter them by
+  # the supported versions for the current language.
+  # The final set of arches is stored in `SLLM_STORE_GPU_ARCHES`.
+  #
+  override_gpu_arches(SLLM_STORE_GPU_ARCHES
+  ${SLLM_STORE_GPU_LANG}
+  "${${SLLM_STORE_GPU_LANG}_SUPPORTED_ARCHS}")
+endif()
 
 #
 # Query torch for additional GPU compilation flags for the given
@@ -150,6 +313,7 @@ define_gpu_extension_target(
   CXX_SRCS ${SLLM_STORE_CXX_EXT_SRC}
   COMPILE_FLAGS ${SLLM_STORE_GPU_FLAGS}
   ARCHITECTURES ${SLLM_STORE_GPU_ARCHES}
+  LIBRARIES glog::glog
   WITH_SOABI)
 
 #
