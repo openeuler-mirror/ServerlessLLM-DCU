@@ -1,0 +1,122 @@
+// ----------------------------------------------------------------------------
+//  ServerlessLLM
+//  Copyright (c) ServerlessLLM Team 2024
+//
+//   Licensed under the Apache License, Version 2.0 (the "License");
+//   you may not use this file except in compliance with the License.
+//
+//   You may obtain a copy of the License at
+//
+//                   http://www.apache.org/licenses/LICENSE-2.0
+//
+//   Unless required by applicable law or agreed to in writing, software
+//   distributed under the License is distributed on an "AS IS" BASIS,
+//   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//   See the License for the specific language governing permissions and
+//   limitations under the License.
+//  ----------------------------------------------------------------------------
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+#ifdef USE_HIP
+#include "checkpoint_store_hip.h"
+#else
+#include "checkpoint_store.h"
+#endif
+
+// Use shell commands instead of std::filesystem to avoid symbol conflicts
+// with PyTorch's libtorch.so which exports incompatible std::filesystem symbols
+void CreateDirectories(const std::string& path) {
+  std::string cmd = "mkdir -p \"" + path + "\"";
+  std::system(cmd.c_str());
+}
+
+void RemoveAll(const std::string& path) {
+  std::string cmd = "rm -rf \"" + path + "\"";
+  std::system(cmd.c_str());
+}
+
+std::string GetParentPath(const std::string& path) {
+  size_t pos = path.find_last_of('/');
+  if (pos == std::string::npos) {
+    return ".";
+  }
+  return path.substr(0, pos);
+}
+
+bool WriteBytesToFile(const std::string& file_path,
+                      const std::vector<uint8_t>& data) {
+  // Ensure the directory exists
+  CreateDirectories(GetParentPath(file_path));
+
+  std::ofstream file(file_path, std::ios::binary);
+  if (!file) {
+    return false;  // Failed to open file
+  }
+  file.write(reinterpret_cast<const char*>(data.data()), data.size());
+  return file.good();  // Return true if the write was successful
+}
+
+class CheckpointStoreTest : public ::testing::TestWithParam<std::string> {
+ protected:
+  static CheckpointStore* storage;
+  static size_t mem_pool_size;
+  static int num_thread;
+  static size_t chunk_size;
+  static std::string storage_path;
+
+  static void SetUpTestSuite() {
+    mem_pool_size = 4L * 1024 * 1024 * 1024;  // 4GB
+    num_thread = 4;
+    chunk_size = 4 * 1024 * 1024;  // 4MB
+  }
+
+  void SetUp() override {
+    storage_path = GetParam();  // ← Parameter injected
+    storage = new CheckpointStore(storage_path, mem_pool_size, num_thread,
+                                  chunk_size);
+  }
+
+  void TearDown() override {
+    delete storage;
+    // Cleanup test files
+    RemoveAll(storage_path);
+  }
+};
+
+CheckpointStore* CheckpointStoreTest::storage = nullptr;
+size_t CheckpointStoreTest::mem_pool_size = 0;
+int CheckpointStoreTest::num_thread = 0;
+size_t CheckpointStoreTest::chunk_size = 0;
+std::string CheckpointStoreTest::storage_path = "";
+
+TEST_P(CheckpointStoreTest, LoadModelFromDisk) {
+  std::string model_path = "facebook/opt-1.3b";
+  size_t model_size = 32 * 1024 * 1024;  // 256MB
+
+  std::vector<uint8_t> model_data(model_size, 0xFF);
+  std::string data_path = storage_path + "/" + model_path + "/tensor.data_0";
+
+  bool write_success = WriteBytesToFile(data_path, model_data);
+  ASSERT_TRUE(write_success) << "Failed to write test data to file";
+
+  size_t registered_model_size = storage->RegisterModelInfo(model_path);
+  EXPECT_EQ(registered_model_size, model_size);
+
+  EXPECT_EQ(storage->LoadModelFromDisk(model_path), 0);
+  EXPECT_EQ(storage->ClearMem(), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    StoragePaths, CheckpointStoreTest,
+    ::testing::Values("./test_models",        // Original storage path
+                      "/dev/shm/test_models"  // New shared-memory path
+                      ));
