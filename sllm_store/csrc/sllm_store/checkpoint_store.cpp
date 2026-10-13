@@ -47,11 +47,19 @@ CheckpointStore::CheckpointStore(const std::string& storage_path,
   for (size_t i = 0; i < num_gpus_; ++i) {
     cudaSetDevice(i);
 
+    // Get GPU UUID
+    char uuidStr[80];
+#ifdef USE_DTK
+    // Hygon DCU/HIP:
+    // DTK's hipDeviceProp_t does not expose props.uuid,
+    // fall back to a stable logical device identifier.
+    // Keep this in sync with GetGpuUUID() in
+    // csrc/checkpoint/checkpoint.cpp.
+    snprintf(uuidStr, sizeof(uuidStr), "dcu-%02zu", i);
+#else
     cudaDeviceProp props;
     cudaGetDeviceProperties(&props, i);
 
-    // Get GPU UUID
-    char uuidStr[80];
     snprintf(
         uuidStr, sizeof(uuidStr),
         "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
@@ -66,6 +74,7 @@ CheckpointStore::CheckpointStore(const std::string& storage_path,
         (unsigned char)props.uuid.bytes[13],
         (unsigned char)props.uuid.bytes[14],
         (unsigned char)props.uuid.bytes[15]);
+#endif
 
     gpu_info_map_[i].uuid_ = std::string(uuidStr);
     LOG(INFO) << "GPU " << i << " UUID: " << gpu_info_map_[i].uuid_;
