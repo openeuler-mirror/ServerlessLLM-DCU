@@ -17,12 +17,9 @@
 //  ----------------------------------------------------------------------------
 #include "checkpoint.h"
 
-#include <ATen/cuda/CUDABlas.h>
-#include <cublas_v2.h>
 #include <cuda_runtime_api.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <nvml.h>
 #include <sys/stat.h>
 #include <torch/extension.h>
 #include <torch/script.h>  // One-stop header.
@@ -161,11 +158,19 @@ std::unordered_map<std::string, int> GetGpuUUID() {
   std::unordered_map<std::string, int> uuidToDeviceIdMap;
 
   for (int devId = 0; devId < deviceCount; ++devId) {
+    // Convert UUID bytes to string with unsigned char casting
+    char uuidStr[80];
+#ifdef USE_DTK
+    // Hygon DCU/HIP:
+    // DTK's hipDeviceProp_t does not expose props.uuid,
+    // fall back to a stable logical device identifier.
+    // Keep this in sync with the CheckpointStore constructor in
+    // csrc/sllm_store/checkpoint_store.cpp.
+    snprintf(uuidStr, sizeof(uuidStr), "dcu-%02d", devId);
+#else
     cudaDeviceProp props;
     cudaGetDeviceProperties(&props, devId);  // Get properties for each device
 
-    // Convert UUID bytes to string with unsigned char casting
-    char uuidStr[80];
     snprintf(
         uuidStr, sizeof(uuidStr),
         "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
@@ -180,6 +185,7 @@ std::unordered_map<std::string, int> GetGpuUUID() {
         (unsigned char)props.uuid.bytes[13],
         (unsigned char)props.uuid.bytes[14],
         (unsigned char)props.uuid.bytes[15]);
+#endif
 
     uuidToDeviceIdMap[std::string(uuidStr)] = devId;
   }

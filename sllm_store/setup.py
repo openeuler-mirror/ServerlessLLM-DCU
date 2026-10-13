@@ -27,28 +27,36 @@ from setuptools.command.build_ext import build_ext
 from setuptools.command.install import install
 
 
-from torch.utils.cpp_extension import CUDA_HOME
-from torch.utils.cpp_extension import ROCM_HOME
+try:
+    torch_available = True
+    from torch.utils.cpp_extension import CUDA_HOME
+    from torch.utils.cpp_extension import ROCM_HOME
+except Exception:
+    torch_available = False
+    CUDA_HOME = None
+    ROCM_HOME = None
+    print(
+        "[WARNING] Unable to import torch, GPU extension build will fail. "
+        "Please visit https://pytorch.org/ to see how to properly install torch on your system."  # noqa: E501
+    )
 
 
 ROOT_DIR = os.path.dirname(__file__)
 
 
-def check_nvcc_installed(cuda_home: str) -> None:
+def check_nvcc_installed(cuda_home: str) -> bool:
     """Check if nvcc (NVIDIA CUDA compiler) is installed."""
     try:
         _ = subprocess.check_output(
             [cuda_home + "/bin/nvcc", "-V"], universal_newlines=True
         )
-    except Exception as e:
-        raise RuntimeError(
-            "nvcc is not installed or not found in your PATH. "
-            "Please ensure that the CUDA toolkit is installed and nvcc is available in your PATH."  # noqa: E501
-            f" Error: {e}"
-        ) from None
+        return True
+    except Exception:
+        print("[WARNING] nvcc is not installed or not found in your PATH.")
+        return False
 
 
-def check_hipcc_installed(rocm_home: str) -> None:
+def check_hipcc_installed(rocm_home: str) -> bool:
     """Check if hipcc (AMD HIP compiler) is installed."""
     # can be either <ROCM_HOME>/hip/bin/hipcc or <ROCM_HOME>/bin/hipcc
     hipcc_paths = [rocm_home + "/bin/hipcc", rocm_home + "/hip/bin/hipcc"]
@@ -57,29 +65,102 @@ def check_hipcc_installed(rocm_home: str) -> None:
             _ = subprocess.check_output(
                 [hipcc, "--version"], universal_newlines=True
             )
-            return
+            return True
         except Exception:
             continue
-    raise RuntimeError(
-        "hipcc is not installed or not found in your PATH. "
-        "Please ensure that the HIP toolkit is installed and hipcc is available in your PATH."  # noqa: E501
-    ) from None
+    print("[WARNING] hipcc is not installed or not found in your PATH.")
+    return False
 
 
-if CUDA_HOME is not None:
-    check_nvcc_installed(CUDA_HOME)
-elif ROCM_HOME is not None:
-    check_hipcc_installed(ROCM_HOME)
-else:
+def check_dtk_compiler_installed(dtk_home: str) -> bool:
+    """Check whether the Hygon DTK compiler is available."""
+
+    if not dtk_home:
+        return False
+
+    compiler_paths = [
+        os.path.join(dtk_home, "bin", "hipcc"),
+        os.path.join(dtk_home, "hip", "bin", "hipcc"),
+        os.path.join(dtk_home, "bin", "dcc"),
+    ]
+
+    for compiler in compiler_paths:
+        if not os.path.isfile(compiler):
+            continue
+
+        try:
+            subprocess.check_output(
+                [compiler, "--version"],
+                universal_newlines=True,
+                stderr=subprocess.STDOUT,
+            )
+            print(f"[INFO] DTK compiler found: {compiler}")
+            return True
+        except Exception as exc:
+            print(f"[WARNING] Failed to execute {compiler}: {exc}")
+
+    print(f"[WARNING] No usable hipcc/dcc found under {dtk_home}")
+    return False
+
+
+def detect_build_backend():
+    """Detect which GPU backend to build based on environment variables."""
+
+    use_dtk = os.getenv("USE_DTK", "0").lower() in ("1", "true", "yes")
+    use_cuda = os.getenv("USE_CUDA", "auto").lower()
+    use_rocm = os.getenv("USE_ROCM", "auto").lower()
+
+    # DTK path priority:
+    # 1. DTK_HOME
+    # 2. ROCM_HOME environment variable
+    # 3. Current Hygon installation
+    dtk_home = (
+        os.getenv("DTK_HOME")
+        or os.getenv("ROCM_HOME")
+        or "/opt/dtk-26.04"
+    )
+
+    # Hygon DTK support
+    if use_dtk:
+        if check_dtk_compiler_installed(dtk_home):
+            print(f"[INFO] Hygon DTK toolkit found at: {dtk_home}")
+            return "dtk", dtk_home
+        raise RuntimeError(
+            f"USE_DTK was requested, but no usable HIP compiler "
+            f"(hipcc/dcc) was found under {dtk_home}. "
+            f"Set DTK_HOME or ROCM_HOME to the DTK installation root."
+        )
+
+    # NVIDIA CUDA support
+    if use_cuda != "false" and CUDA_HOME is not None:
+        if check_nvcc_installed(CUDA_HOME):
+            return "cuda", CUDA_HOME
+        print("[WARNING] CUDA requested but nvcc not available, falling back...")
+
+    # AMD ROCm support
+    if use_rocm != "false" and ROCM_HOME is not None:
+        if check_hipcc_installed(ROCM_HOME):
+            return "rocm", ROCM_HOME
+        print("[WARNING] ROCm available but hipcc not working, falling back...")
+
     raise RuntimeError(
-        "CUDA_HOME or ROCM_HOME environment variable must be set to compile CUDA or HIP extensions."  # noqa: E501
+        "No usable GPU backend found. To build for Hygon DCU set "
+        "USE_DTK=1 and DTK_HOME (or ROCM_HOME) to the DTK installation root."
     )
 
 
+# Detect build backend
+BUILD_BACKEND, BACKEND_HOME = detect_build_backend()
+print(f"[INFO] Building with backend: {BUILD_BACKEND}")
+
+
 def is_ninja_available() -> bool:
+    # Allow disabling ninja via environment variable
+    if os.getenv("DISABLE_NINJA", "0").lower() in ("1", "true", "yes"):
+        return False
     try:
         subprocess.run(["ninja", "--version"], stdout=subprocess.PIPE)
-    except FileNotFoundError:
+    except (FileNotFoundError, OSError):
         return False
     return True
 
@@ -174,6 +255,48 @@ class cmake_build_ext(build_ext):
         cmake_args += [
             "-DSLLM_STORE_PYTHON_EXECUTABLE={}".format(sys.executable)
         ]
+
+        # Add backend-specific arguments
+        if BUILD_BACKEND == "dtk":
+            cmake_args += [
+                "-DUSE_DTK=ON",
+                "-DUSE_ROCM=OFF",
+                "-DUSE_CUDA=OFF",
+            ]
+
+            # Allow pointing FetchContent at local copies of glog/googletest
+            # for offline DTK build machines. Only passed when the path
+            # actually exists; otherwise FetchContent falls back to git.
+            glog_src = os.getenv("SLLM_GLOG_SOURCE_DIR", "/opt/glog")
+            if os.path.isdir(glog_src):
+                cmake_args.append(
+                    "-DFETCHCONTENT_SOURCE_DIR_GLOG={}".format(glog_src)
+                )
+
+            gtest_src = os.getenv(
+                "SLLM_GOOGLETEST_SOURCE_DIR",
+                "/root/ServerlessLLM-master/sllm_offline_deps/googletest",
+            )
+            if os.path.isdir(gtest_src):
+                cmake_args.append(
+                    "-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST={}".format(gtest_src)
+                )
+
+        elif BUILD_BACKEND == "cuda":
+            cmake_args += [
+                "-DUSE_CUDA=ON",
+                "-DUSE_ROCM=OFF",
+                "-DUSE_DTK=OFF",
+                "-DCUDA_TOOLKIT_ROOT_DIR={}".format(BACKEND_HOME),
+            ]
+
+        elif BUILD_BACKEND == "rocm":
+            cmake_args += [
+                "-DUSE_ROCM=ON",
+                "-DUSE_DTK=OFF",
+                "-DUSE_CUDA=OFF",
+                "-DHIP_ROOT_DIR={}".format(BACKEND_HOME),
+            ]
 
         if is_ninja_available():
             build_tool = ["-G", "Ninja"]
