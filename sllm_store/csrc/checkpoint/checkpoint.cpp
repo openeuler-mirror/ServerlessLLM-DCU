@@ -16,7 +16,8 @@
 //   limitations under the License.
 //  ----------------------------------------------------------------------------
 #include "checkpoint.h"
-
+#include <cstdio>
+#include <stdexcept>
 #include <cuda_runtime_api.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -161,12 +162,20 @@ std::unordered_map<std::string, int> GetGpuUUID() {
     // Convert UUID bytes to string with unsigned char casting
     char uuidStr[80];
 #ifdef USE_DTK
-    // Hygon DCU/HIP:
-    // DTK's hipDeviceProp_t does not expose props.uuid,
-    // fall back to a stable logical device identifier.
-    // Keep this in sync with the CheckpointStore constructor in
-    // csrc/sllm_store/checkpoint_store.cpp.
-    snprintf(uuidStr, sizeof(uuidStr), "dcu-%02d", devId);
+    // Use a physical device identifier shared across processes.
+    char pci_bus_id[32] = {};
+    cudaError_t pci_status = cudaDeviceGetPCIBusId(
+        pci_bus_id, sizeof(pci_bus_id), devId);
+
+    if (pci_status != cudaSuccess || pci_bus_id[0] == '\0') {
+      throw std::runtime_error(
+          "Failed to query PCI bus ID for device " +
+          std::to_string(devId) + ": " +
+          cudaGetErrorString(pci_status));
+    }
+
+    std::snprintf(
+        uuidStr, sizeof(uuidStr), "dcu-pci-%s", pci_bus_id);
 #else
     cudaDeviceProp props;
     cudaGetDeviceProperties(&props, devId);  // Get properties for each device

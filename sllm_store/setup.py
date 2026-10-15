@@ -103,12 +103,30 @@ def check_dtk_compiler_installed(dtk_home: str) -> bool:
     return False
 
 
+
+def get_backend_mode(name: str, default: str = "auto") -> str:
+    """Normalize a backend switch to true, false, or auto."""
+    value = os.getenv(name, default).strip().lower()
+
+    if value in ("1", "true", "yes", "on"):
+        return "true"
+
+    if value in ("0", "false", "no", "off"):
+        return "false"
+
+    if value == "auto":
+        return "auto"
+
+    raise RuntimeError(
+        f"Invalid value for {name}: {value!r}. "
+        "Expected auto, 1/0, true/false, yes/no, or on/off."
+    )
+
 def detect_build_backend():
     """Detect which GPU backend to build based on environment variables."""
-
-    use_dtk = os.getenv("USE_DTK", "0").lower() in ("1", "true", "yes")
-    use_cuda = os.getenv("USE_CUDA", "auto").lower()
-    use_rocm = os.getenv("USE_ROCM", "auto").lower()
+    use_dtk = get_backend_mode("USE_DTK", default="false") == "true"
+    use_cuda = get_backend_mode("USE_CUDA")
+    use_rocm = get_backend_mode("USE_ROCM")
 
     # DTK path priority:
     # 1. DTK_HOME
@@ -262,32 +280,15 @@ class cmake_build_ext(build_ext):
                 "-DUSE_DTK=ON",
                 "-DUSE_ROCM=OFF",
                 "-DUSE_CUDA=OFF",
+                "-DHIP_ROOT_DIR={}".format(BACKEND_HOME),
             ]
-
-            # Allow pointing FetchContent at local copies of glog/googletest
-            # for offline DTK build machines. Only passed when the path
-            # actually exists; otherwise FetchContent falls back to git.
-            glog_src = os.getenv("SLLM_GLOG_SOURCE_DIR", "/opt/glog")
-            if os.path.isdir(glog_src):
-                cmake_args.append(
-                    "-DFETCHCONTENT_SOURCE_DIR_GLOG={}".format(glog_src)
-                )
-
-            gtest_src = os.getenv(
-                "SLLM_GOOGLETEST_SOURCE_DIR",
-                "/root/ServerlessLLM-master/sllm_offline_deps/googletest",
-            )
-            if os.path.isdir(gtest_src):
-                cmake_args.append(
-                    "-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST={}".format(gtest_src)
-                )
 
         elif BUILD_BACKEND == "cuda":
             cmake_args += [
                 "-DUSE_CUDA=ON",
                 "-DUSE_ROCM=OFF",
                 "-DUSE_DTK=OFF",
-                "-DCUDA_TOOLKIT_ROOT_DIR={}".format(BACKEND_HOME),
+                "-DCUDAToolkit_ROOT={}".format(BACKEND_HOME),
             ]
 
         elif BUILD_BACKEND == "rocm":
@@ -298,6 +299,41 @@ class cmake_build_ext(build_ext):
                 "-DHIP_ROOT_DIR={}".format(BACKEND_HOME),
             ]
 
+        # Local dependency sources are independent of the GPU backend.
+        offline_build = get_backend_mode(
+            "SLLM_OFFLINE_BUILD", default="false"
+        ) == "true"
+
+        dependency_sources = {
+            "GLOG": "SLLM_GLOG_SOURCE_DIR",
+            "GOOGLETEST": "SLLM_GOOGLETEST_SOURCE_DIR",
+        }
+
+        for dependency, env_name in dependency_sources.items():
+            source_dir = os.getenv(env_name)
+
+            if not source_dir:
+                if offline_build:
+                    raise RuntimeError(
+                        f"Offline build requires {env_name} to point "
+                        f"to the local {dependency} source directory."
+                    )
+                continue
+
+            # Resolve before CMake runs from self.build_temp.
+            source_dir = os.path.abspath(os.path.expanduser(source_dir))
+
+            if not os.path.isfile(
+                os.path.join(source_dir, "CMakeLists.txt")
+            ):
+                raise RuntimeError(
+                    f"Invalid {env_name}: {source_dir!r}. "
+                    "Expected a source directory containing CMakeLists.txt."
+                )
+
+            cmake_args.append(
+                f"-DFETCHCONTENT_SOURCE_DIR_{dependency}={source_dir}"
+            )
         if is_ninja_available():
             build_tool = ["-G", "Ninja"]
             cmake_args += [
