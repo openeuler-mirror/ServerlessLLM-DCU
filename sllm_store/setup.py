@@ -398,6 +398,9 @@ setup(
     extras_require=extras,
     entry_points={
         "console_scripts": ["sllm-store=sllm_store.cli:main"],
+        "vllm.general_plugins": [
+            "sllm_store_dtk=sllm_store.vllm_plugin:register",
+        ],
     },
     package_data={
         "sllm_store": ["py.typed", "*.so"],

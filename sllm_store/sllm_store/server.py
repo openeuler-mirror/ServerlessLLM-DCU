@@ -1,39 +1,13 @@
 import asyncio
 import grpc
-import sllm_store
 from sllm_store.proto import storage_pb2, storage_pb2_grpc
 from sllm_store.logger import init_logger
 
 # this is necessary to avoid libtorch.so not found error
 import torch  # noqa: F401
 
-import ctypes
-import os
-
-
-def _load_packaged_glog() -> None:
-    """
-    Load the package-local glog library only when it exists.
-
-    Some builds bundle libglog.so inside the sllm_store package,
-    while other builds link the native extension against a system
-    or build-time glog library.
-    """
-
-    glog_path = os.path.join(
-        sllm_store.__path__[0],
-        "libglog.so",
-    )
-
-    if os.path.isfile(glog_path):
-        ctypes.CDLL(
-            glog_path,
-            mode=getattr(ctypes, "RTLD_GLOBAL", 0),
-        )
-
-
-_load_packaged_glog()
-
+# Package __init__.py already preloads bundled glog with RTLD_LOCAL.
+# Do not reopen it with RTLD_GLOBAL here: that can promote its visibility.
 from sllm_store._checkpoint_store import (  # noqa: E402
     CheckpointStore,
     MemCopyChunk,
