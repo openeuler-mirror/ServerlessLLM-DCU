@@ -34,7 +34,7 @@ def _load_packaged_glog() -> None:
         _os.path.dirname(_os.path.abspath(__file__)), "libglog.so"
     )
     if _os.path.isfile(_glog_path):
-        ctypes.CDLL(_glog_path, mode=getattr(ctypes, "RTLD_GLOBAL", 0))
+        ctypes.CDLL(_glog_path, mode=getattr(ctypes, "RTLD_LOCAL", 0))
 
 
 _load_packaged_glog()
