@@ -23,8 +23,9 @@ import os
 import time
 import uuid
 from dataclasses import fields
-from typing import Any, Dict, List, Optional, Sequence, Union, cast
+from typing import Any, Dict, List, Optional, Sequence, Set, Union, cast
 
+import ray
 import torch
 from vllm import (
     AsyncEngineArgs,
@@ -44,6 +45,71 @@ from sllm.backends.backend_utils import (
 )
 
 logger = logging.getLogger("ray")
+
+# Device visibility variables used by CUDA and ROCm/DTK (Hygon DCU) runtimes.
+_VISIBLE_DEVICE_ENV_VARS = (
+    "ROCR_VISIBLE_DEVICES",
+    "HIP_VISIBLE_DEVICES",
+    "CUDA_VISIBLE_DEVICES",
+    "GPU_DEVICE_ORDINAL",
+)
+
+def _is_hip_runtime() -> bool:
+    """Whether PyTorch is built on HIP (AMD GPUs / Hygon DCUs)."""
+    return getattr(torch.version, "hip", None) is not None
+
+
+def _get_async_engine_arg_names() -> Set[str]:
+    """Return AsyncEngineArgs fields, tolerating non-dataclass vLLM forks."""
+    try:
+        return {field.name for field in fields(AsyncEngineArgs)}
+    except (TypeError, ValueError):
+        return set(inspect.signature(AsyncEngineArgs).parameters)
+
+def _get_ray_gpu_ids() -> List[str]:
+    """Read the logical GPU/DCU IDs Ray assigned to this model actor."""
+    try:
+        accelerator_ids = ray.get_runtime_context().get_accelerator_ids()
+        return [str(device_id) for device_id in accelerator_ids.get("GPU", [])]
+    except Exception as exc:
+        logger.warning("Unable to read Ray accelerator IDs: %s", exc)
+        return []
+
+
+def _get_visible_device_env() -> Dict[str, str]:
+    return {
+        env_name: os.environ[env_name]
+        for env_name in _VISIBLE_DEVICE_ENV_VARS
+        if env_name in os.environ
+    }
+
+
+def _release_accelerator_memory() -> None:
+    """Release cached accelerator memory; ROCm/DTK also uses torch.cuda."""
+    if not torch.cuda.is_available():
+        return
+
+    try:
+        torch.cuda.synchronize()
+    except Exception as exc:
+        logger.warning("Accelerator synchronize failed during shutdown: %s", exc)
+
+    try:
+        torch.cuda.empty_cache()
+    except Exception as exc:
+        logger.warning("Accelerator cache cleanup failed during shutdown: %s", exc)
+
+
+async def _call_shutdown_method(obj: Any, method_name: str) -> bool:
+    """Call a possibly async shutdown method on a vLLM object."""
+    method = getattr(obj, method_name, None)
+    if method is None or not callable(method):
+        return False
+
+    result = method()
+    if inspect.isawaitable(result):
+        await result
+    return True
 
 
 def process_output(output: RequestOutput, model_name: str) -> Dict[str, Any]:
@@ -148,19 +214,68 @@ class VllmBackend(SllmBackend):
         if backend_config is None:
             raise ValueError("Backend config is missing")
 
+        # Get the accelerator IDs assigned to the current Ray actor.
+        assigned_gpu_ids = _get_ray_gpu_ids()
+        is_hip = _is_hip_runtime()
+
+        # Default to Ray's allocated device count for tensor parallelism on HIP.
+        tensor_parallel_size: Optional[int] = None
+        if is_hip:
+            tensor_parallel_size = int(
+                backend_config.get(
+                    "tensor_parallel_size",
+                    len(assigned_gpu_ids) if assigned_gpu_ids else 1,
+                )
+            )
+            if tensor_parallel_size < 1:
+                raise ValueError(
+                    "tensor_parallel_size must be >= 1, "
+                    f"got {tensor_parallel_size}"
+                )
+
+            strict_accelerator_check = bool(
+                backend_config.get("strict_accelerator_check", True)
+            )
+            if assigned_gpu_ids and (
+                len(assigned_gpu_ids) != tensor_parallel_size
+            ):
+                message = (
+                    "Ray GPU allocation does not match vLLM tensor parallel "
+                    f"size: ray_gpu_ids={assigned_gpu_ids}, "
+                    f"tensor_parallel_size={tensor_parallel_size}, "
+                    f"visible_device_env={_get_visible_device_env()}. "
+                    "Set model_config.num_gpus equal to "
+                    "backend_config.tensor_parallel_size."
+                )
+                if strict_accelerator_check:
+                    raise RuntimeError(message)
+                logger.warning(message)
+
+            logger.info(
+                "Accelerator assignment: ray_gpu_ids=%s, "
+                "tensor_parallel_size=%s, hip_runtime=%s",
+                assigned_gpu_ids,
+                tensor_parallel_size,
+                is_hip,
+            )
+
         self.status: BackendStatus = BackendStatus.UNINITIALIZED
         self.status_lock = asyncio.Lock()
         self.backend_config = backend_config
         self.request_trace = LLMEngineStatusDict()
         # if trace_debug is True, request trace will not be deleted after completion
         self.trace_debug = backend_config.get("trace_debug", False)
-        self.enforce_eager = backend_config.get("enforce_eager", False)
+
+        # Use eager execution and disable prefix caching by default on HIP.
+        self.enforce_eager = backend_config.get(
+            "enforce_eager", is_hip
+        )
         self.enable_prefix_caching = backend_config.get(
-            "enable_prefix_caching", True
+            "enable_prefix_caching", not is_hip
         )
         self.task = backend_config.get("task", "auto")
+        async_engine_fields = _get_async_engine_arg_names()
 
-        async_engine_fields = {f.name for f in fields(AsyncEngineArgs)}
         filtered_engine_config = {
             k: v for k, v in backend_config.items() if k in async_engine_fields
         }
@@ -172,9 +287,15 @@ class VllmBackend(SllmBackend):
 
         if load_format is not None:
             filtered_engine_config["load_format"] = load_format
-            filtered_engine_config["model"] = backend_config.get(
+            pretrained_path = backend_config.get(
                 "pretrained_model_name_or_path"
             )
+            if not pretrained_path:
+                raise ValueError(
+                    "pretrained_model_name_or_path is required when "
+                    "load_format is explicitly configured"
+                )
+            filtered_engine_config["model"] = pretrained_path
         else:
             storage_path = os.getenv(
                 "STORAGE_PATH", os.path.expanduser("~/models")
@@ -183,12 +304,24 @@ class VllmBackend(SllmBackend):
             filtered_engine_config["model"] = model_path
             filtered_engine_config["load_format"] = "serverless_llm"
 
-        # NOTE: Automatic enable prefix cachinging
         filtered_engine_config["enforce_eager"] = self.enforce_eager
         filtered_engine_config["enable_prefix_caching"] = (
             self.enable_prefix_caching
         )
         filtered_engine_config["task"] = self.task
+
+        # Use multiprocessing for tensor parallelism on HIP runtimes.
+        if is_hip:
+            filtered_engine_config["tensor_parallel_size"] = tensor_parallel_size
+            filtered_engine_config["distributed_executor_backend"] = (
+                backend_config.get("distributed_executor_backend", "mp")
+            )
+
+        # Disable custom all-reduce by default on HIP runtimes.
+        if is_hip:
+            filtered_engine_config["disable_custom_all_reduce"] = (
+                backend_config.get("disable_custom_all_reduce", True)
+            )
 
         logger.info(
             f"Creating new VLLM engine with config: {filtered_engine_config}"
@@ -202,6 +335,15 @@ class VllmBackend(SllmBackend):
         async with self.status_lock:
             if self.status != BackendStatus.UNINITIALIZED:
                 return
+
+            # Log device visibility right before creating the engine to make
+            # accelerator allocation problems easy to diagnose.
+            logger.info(
+                "Initializing vLLM backend: ray_gpu_ids=%s, "
+                "visible_device_env=%s",
+                _get_ray_gpu_ids(),
+                _get_visible_device_env(),
+            )
             self.engine = AsyncLLMEngine.from_engine_args(self.engine_args)
             self.status = BackendStatus.RUNNING
 
@@ -269,16 +411,31 @@ class VllmBackend(SllmBackend):
                 return
             self.status = BackendStatus.DELETING
 
-        # Abort all requests
-        requests = await self.request_trace.return_all_request_ids()
-        tasks = [self.engine.abort(request_id) for request_id in requests]
-        await asyncio.gather(*tasks)
-        if hasattr(self, "engine"):
-            del self.engine
+        engine = self.engine
+        if engine is not None:
+            # Abort all requests.
+            requests = await self.request_trace.return_all_request_ids()
+            tasks = [engine.abort(request_id) for request_id in requests]
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Different vLLM versions expose different shutdown hooks; call
+            # them opportunistically and fall back to garbage collection.
+            try:
+                await _call_shutdown_method(
+                    engine, "shutdown_background_loop"
+                )
+            except Exception as exc:
+                logger.warning(
+                    "vLLM background-loop shutdown failed: %s", exc
+                )
+
+        self.engine = None
+        del engine
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+
+        # ROCm/DTK PyTorch builds also expose the accelerator via torch.cuda.
+        _release_accelerator_memory()
 
     async def stop(self) -> None:
         """Wait for all requests to finish and shutdown the backend."""
