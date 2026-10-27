@@ -36,6 +36,24 @@ from sllm_store.client import SllmStoreClient
 logger = init_logger(__name__)
 
 
+def _get_worker_gpu_counts(worker_node_info):
+    """Get each worker's GPU/DCU count from its Ray node resources."""
+    gpu_counts = {node_id: 0 for node_id in worker_node_info}
+    for ray_node in ray.nodes():
+        if not ray_node.get("Alive", False):
+            continue
+        resources = ray_node.get("Resources", {})
+        ray_address = ray_node.get("NodeManagerAddress")
+        for node_id, node_info in worker_node_info.items():
+            if (
+                resources.get(f"worker_id_{node_id}", 0) > 0
+                or node_info.get("address") == ray_address
+            ):
+                gpu_counts[node_id] = int(resources.get("GPU", 0))
+                break
+    return gpu_counts
+
+
 class SllmLocalStore:
     def __init__(
         self,
@@ -360,6 +378,31 @@ class StoreManager:
             return
         backend_config = model_config.get("backend_config", {})
         placement_config = model_config.get("placement_config", {})
+        num_gpus = model_config.get("num_gpus", 1)
+        tensor_parallel_size = None
+        if backend == "vllm":
+            # Downloader reserves num_gpus devices; vLLM needs the same.
+            tensor_parallel_size = int(
+                backend_config.get("tensor_parallel_size", 1)
+            )
+            num_gpus = int(num_gpus)
+            if tensor_parallel_size < 1:
+                raise ValueError(
+                    f"tensor_parallel_size must be >= 1 for {model_name}, "
+                    f"got {tensor_parallel_size}"
+                )
+            if num_gpus < 1:
+                raise ValueError(
+                    f"num_gpus must be >= 1 for {model_name}, "
+                    f"got {num_gpus}"
+                )
+            if num_gpus != tensor_parallel_size:
+                raise ValueError(
+                    f"num_gpus ({num_gpus}) must equal "
+                    "backend_config.tensor_parallel_size "
+                    f"({tensor_parallel_size}) for {model_name}: the vLLM "
+                    "downloader reserves exactly num_gpus devices"
+                )
         if model_name not in self.model_info:
             self.model_storage_info[model_name] = {}
             logger.info(f"Registering new {model_name}")
@@ -390,20 +433,51 @@ class StoreManager:
                         logger.error(f"Node {node_id} not found")
                         raise ValueError(f"Node {node_id} not found")
 
+            # GPU-aware filtering: off by default, auto-on for ROCm/HIP or
+            # via SLLM_FILTER_NODES_BY_GPU; avoids under-provisioned nodes.
+            schedulable_nodes = list(worker_node_info)
+            worker_gpu_counts = {}
+            explicit_filter = os.getenv("SLLM_FILTER_NODES_BY_GPU")
+            if explicit_filter is not None:
+                filter_by_gpu = (
+                    explicit_filter.strip().lower() in ("1", "true", "yes")
+                )
+            else:
+                accelerator = str(
+                    backend_config.get(
+                        "accelerator", os.getenv("SLLM_ACCELERATOR", "")
+                    )
+                ).lower()
+                filter_by_gpu = accelerator in ("hygon", "dcu", "rocm", "hip")
+            if backend == "vllm" and filter_by_gpu:
+                worker_gpu_counts = _get_worker_gpu_counts(worker_node_info)
+                schedulable_nodes = [
+                    node_id
+                    for node_id in schedulable_nodes
+                    if node_id in self.local_servers
+                    and worker_gpu_counts.get(node_id, 0) >= num_gpus
+                ]
+                if not schedulable_nodes:
+                    raise RuntimeError(
+                        f"No initialized worker can provide {num_gpus} "
+                        f"GPUs; worker GPU counts: {worker_gpu_counts}"
+                    )
+
             local_disk = []
             if placement_config and "local_disk" in placement_config:
                 local_disk = placement_config["local_disk"]
                 if not all(
-                    [node_id in worker_node_info for node_id in local_disk]
+                    [node_id in schedulable_nodes for node_id in local_disk]
                 ):
                     logger.error(
-                        f"Invalid target nodes {local_disk}, worker nodes: {worker_node_info}"  # noqa: E501
+                        f"Invalid target nodes {local_disk}, eligible nodes: {schedulable_nodes}, "  # noqa: E501
+                        f"worker GPU counts: {worker_gpu_counts}"
                     )
                     return
             else:
-                # round-robin
-                node_id = list(worker_node_info.keys())[
-                    self.round_robin_index % n_nodes
+                # round-robin among the workers that can host this model
+                node_id = schedulable_nodes[
+                    self.round_robin_index % len(schedulable_nodes)
                 ]
                 self.round_robin_index += 1
                 local_disk = [node_id]
@@ -443,9 +517,12 @@ class StoreManager:
                         model_name,
                         pretrained_model_name_or_path,
                         node_id,
-                        model_config.get("num_gpus", 1),
-                        backend_config.get("tensor_parallel_size", 1),
+                        num_gpus,
+                        tensor_parallel_size,
                         backend_config.get("torch_dtype", "float16"),
+                        backend_config.get("pattern"),
+                        backend_config.get("max_size"),
+                        backend_config,
                     )
                 else:
                     logger.error(f"Backend {backend} not supported")
@@ -459,9 +536,7 @@ class StoreManager:
                 logger.info(f"{model_name} downloaded to node {node_id}")
                 if node_id in memory_pool:
                     # preload to memory pool
-                    await self.load_to_host(
-                        node_id, pretrained_model_name_or_path
-                    )
+                    await self.load_to_host(node_id, model_name)
                     logger.info(f"{model_name} loaded to memory pool")
             self.model_info[model_name] = model_size
             logger.info(f"{model_name} registered")
@@ -526,21 +601,56 @@ class StoreManager:
         num_gpus,
         tensor_parallel_size,
         torch_dtype,
+        pattern=None,
+        max_size=None,
+        backend_config=None,
     ):
+        """Run the temporary vLLM conversion actor on the selected worker.
+
+        The actor is killed in ``finally`` so a failed conversion cannot
+        leak reserved GPUs and block later placements on that node.
+        """
         logger.info(
             f"Downloading {pretrained_model_name_or_path} to node {node_id}"
         )
-        vllm_backend_downloader = (
-            ray.remote(VllmModelDownloader)
-            .options(
-                num_gpus=num_gpus,
-                resources={"worker_node": 0.1, f"worker_id_{node_id}": 0.1},
+        vllm_backend_downloader = None
+        try:
+            vllm_backend_downloader = (
+                ray.remote(VllmModelDownloader)
+                .options(
+                    num_gpus=num_gpus,
+                    resources={
+                        "worker_node": 0.1,
+                        f"worker_id_{node_id}": 0.1,
+                    },
+                )
+                .remote()
             )
-            .remote()
-        )
-        return await vllm_backend_downloader.download_vllm_model.remote(
-            model_name,
-            pretrained_model_name_or_path,
-            torch_dtype,
-            tensor_parallel_size,
-        )
+            return await vllm_backend_downloader.download_vllm_model.remote(
+                model_name,
+                pretrained_model_name_or_path,
+                torch_dtype,
+                tensor_parallel_size,
+                pattern,
+                max_size,
+                backend_config,
+            )
+        except Exception as exc:
+            # Log both controller- and worker-side tracebacks.
+            logger.exception(
+                "Failed to download %s to node %s: %s",
+                model_name,
+                node_id,
+                exc,
+            )
+            raise
+        finally:
+            if vllm_backend_downloader is not None:
+                try:
+                    ray.kill(vllm_backend_downloader, no_restart=True)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to release vLLM downloader for %s: %s",
+                        model_name,
+                        exc,
+                    )

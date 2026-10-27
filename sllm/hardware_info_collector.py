@@ -4,10 +4,10 @@ import tempfile
 import time
 from typing import Dict, Set
 
-import GPUtil
 import psutil
 import ray
 import speedtest
+import torch
 from tqdm import tqdm
 
 from sllm.logger import init_logger
@@ -143,25 +143,29 @@ def get_network_bandwidth(num_iterations=1):
 
 def get_gpu_info():
     """
-    Retrieves information about each NVIDIA GPU.
+    Retrieves information about each GPU/accelerator via torch, since
+    GPUtil is NVIDIA-only and cannot see AMD/Hygon devices.
     Returns:
         dict: Dictionary containing GPU information.
     """
     gpus_info = {}
     try:
-        gpus = GPUtil.getGPUs()
-        if not gpus:
+        gpu_count = torch.cuda.device_count()
+        if not gpu_count:
             gpus_info = "No GPUs found."
         else:
-            for gpu in gpus:
-                gpu_id = gpu.id + 1  # To start GPU numbering from 1
+            for index in range(gpu_count):
+                props = torch.cuda.get_device_properties(index)
+                free_mem, total_mem = torch.cuda.mem_get_info(index)
+                used_mem = total_mem - free_mem
+                gpu_id = index + 1  # To start GPU numbering from 1
                 gpus_info[gpu_id] = {
-                    # "info": gpu.__dict__,
-                    "Name": gpu.name,
-                    "Load": f"{gpu.load * 100:.1f}%",
-                    "Free_Memory": f"{gpu.memoryFree}MB",
-                    "Used_Memory": f"{gpu.memoryUsed}MB",
-                    "Total_Memory": f"{gpu.memoryTotal}MB",
+                    "Name": props.name,
+                    # torch exposes no portable utilization metric.
+                    "Load": "N/A",
+                    "Free_Memory": f"{free_mem // (1024 * 1024)}MB",
+                    "Used_Memory": f"{used_mem // (1024 * 1024)}MB",
+                    "Total_Memory": f"{total_mem // (1024 * 1024)}MB",
                 }
     except Exception as e:
         logger.error(f"Failed to retrieve GPU information: {e}")
