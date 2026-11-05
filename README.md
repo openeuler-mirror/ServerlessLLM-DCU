@@ -124,10 +124,12 @@ sllm-store save \
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 #执行模型转换：
+ 
 sllm-store save \
-  --model ./qwen7b \
+  --model qwen7b \
   --backend transformers \
-  --storage-path ./sllm-qwen7b/models
+  --local-model-path /root/Qwen2.5-7B \
+  --storage-path /data/sllm7B
 ~~~
 
 ![image-20261016162441872](./sllm_store/images/convert.png)
@@ -137,7 +139,7 @@ sllm-store save \
 以离线转换为例，执行以下命令查看转换结果：
 
 ~~~bash
-ls -lh ./sllm-qwen7b/models/qwen7b
+ls -lh /data/sllm7B/qwen7b
 ~~~
 
 转换后的目录包含 config.json、tensor.data_*、tensor_index.json等文件。本次测试中，Qwen2.5-7B-Instruct 转换后的模型文件总大小约为 15GB。
@@ -150,7 +152,9 @@ ls -lh ./sllm-qwen7b/models/qwen7b
 
 ~~~cmd
 sllm-store start \
-  --storage-path /root/sllm-qwen7b/models \
+  --host 0.0.0.0 \
+  --port 8073 \
+  --storage-path /data/sllm7B \
   --mem-pool-size 20GB
 ~~~
 
@@ -173,9 +177,9 @@ sllm-store start \
 
 ```bash
 sllm-store load \
-  --model ./qwen7b \
+  --model qwen7b \
   --backend transformers \
-  --storage-path ./sllm-qwen7b/models
+  --storage-path /data/sllm7B
 ```
 
 **联网环境：**
@@ -186,7 +190,7 @@ sllm-store load \
 sllm-store load \
   --model Qwen/Qwen2.5-7B-Instruct \
   --backend transformers \
-  --storage-path ./sllm-qwen7b/models
+  --storage-path /data/sllm7B
 ```
 
 该命令使用 Transformers 后端加载转换后的模型，并执行 CLI 内置的示例文本生成。
@@ -314,10 +318,16 @@ sllm-store load \
 
 ## 海光 DCU 测试与性能验证
 
-在海光 DCU K100_AI 平台上的初步测试表明，ServerlessLLM 在缓存加载场景下相较 SafeTensors 可获得约 2.2x～2.7x 的加载加速，其中 Llama-3.1-8B-Instruct、Qwen3-32B 和 DeepSeek-R1-Distill-Qwen-32B 分别达到 2.22x、2.74x 和 2.66x。
+在 K100-AI 平台上，以 HuggingFace SafeTensors 标准加载方式作为对比基线，针对Qwen3-32B、Qwen3.6-35B-A3B、Qwen3.8-27B等 27B～35B级大模型开展了加载性能测试。结果表明，在缓存命中的热加载场景下，模型加载速度平均提升约 3.3 倍，提升范围为 2.8～3.7 倍。在模拟 Serverless 冷启动的多副本随机加载场景下，加载速度提升约 1.2～2.4 倍。
+测试结果表明，经过适配的 ServerlessLLM 能够有效降低海光 DCU 平台上的大模型加载时延，尤其在缓存命中场景下加速效果明显。
 
-| 模型                         | 场景   | SafeTensors | ServerlessLLM | 提升倍数 |
-| :--------------------------- | ------ | :---------- | :------------ | :------- |
-| Llama-3.1-8B-Instruct        | Cached | 2.34s       | 1.06s         | 2.22x    |
-| Qwen/Qwen3-32B               | Cached | 10.40s      | 3.79s         | 2.74x    |
-| DeepSeek-R1-Distill-Qwen-32B | Cached | 11.22s      | 4.21s         | 2.66x    |
+| 模型                            | 场景   | SafeTensors | ServerlessLLM | 提升倍数  |
+| :------------------------------ | :----- | :---------- | :------------ | :-------- |
+| **Qwen3-32B**                   | Random | 290.4s      | 236.6s        | **1.23x** |
+|                                 | Cached | 12.0s       | 3.3s          | **3.65x** |
+| **Qwen3.6-35B-A3B**             | Random | 359.8s      | 248.3s        | **1.45x** |
+|                                 | Cached | 12.4s       | 3.5s          | **3.51x** |
+| **Qwen3.8-27B**                 | Random | 281.9s      | 188.2s        | **1.50x** |
+|                                 | Cached | 9.6s        | 2.9s          | **3.29x** |
+| **Qwen3-30B-A3B-Instruct-2507** | Random | 291.2s      | 222.3s        | **1.31x** |
+|                                 | Cached | 15.7s       | 5.6s          | **2.82x** |

@@ -22,6 +22,7 @@ import shutil
 import stat
 import sys
 import time
+from tempfile import TemporaryDirectory
 from typing import Optional
 
 import torch
@@ -46,6 +47,26 @@ _WEIGHT_SUFFIXES = {
     ".bin", ".pt", ".pth", ".safetensors", ".ckpt", ".h5", ".msgpack",
     ".onnx", ".gguf",
 }
+
+
+_TOKENIZER_FILES = (
+    "tokenizer_config.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "spiece.model",
+    "sentencepiece.bpe.model",
+    "vocab.json",
+    "vocab.txt",
+    "merges.txt",
+    "tekken.json",
+)
+
+
+def _has_tokenizer_files(model_path: Path) -> bool:
+    """Return whether a saved model directory contains tokenizer assets."""
+    return model_path.is_dir() and any(
+        (model_path / filename).is_file() for filename in _TOKENIZER_FILES
+    )
 
 
 def resolve_storage_path(cli_path: Optional[str]) -> str:
@@ -80,6 +101,44 @@ def _vllm_model_path(storage_path: str, model_name: str) -> Path:
     if resolved == root or root not in resolved.parents:
         raise ValueError(f"Model path escapes storage directory: {model_name}")
     return target
+
+
+def _transformers_output_name(model_identifier: str) -> str:
+    """Convert a Transformers model/adapter identifier to a safe storage key.
+
+    Hugging Face IDs such as ``org/model`` keep their namespace. If the caller
+    supplied an absolute local path as ``--model`` or ``--adapter-name``, only
+    its final directory name is used as the Store key.
+    """
+    if not model_identifier:
+        raise ValueError("Model or adapter name must not be empty")
+
+    if "\\" in model_identifier or any(
+        ord(char) < 32 for char in model_identifier
+    ):
+        raise ValueError("Model or adapter name contains an invalid character")
+
+    candidate = Path(model_identifier).expanduser()
+    if candidate.is_absolute():
+        output_name = candidate.name
+    else:
+        output_name = model_identifier[2:] if model_identifier.startswith("./") else model_identifier
+
+    if (
+        not output_name
+        or any(part in ("", ".", "..") for part in output_name.split("/"))
+    ):
+        raise ValueError(
+            "Model or adapter name must be a relative name such as 'qwen7b' "
+            "or 'Qwen/Qwen2.5-7B', or an absolute local source path"
+        )
+    return output_name
+
+
+def _transformers_model_path(storage_path: str, model_identifier: str) -> Path:
+    """Resolve a Transformers model/adapter key safely under storage_path."""
+    output_name = _transformers_output_name(model_identifier)
+    return _vllm_model_path(storage_path, output_name)
 
 
 def _copy_vllm_metadata(input_dir: Path, output_dir: Path) -> None:
@@ -386,10 +445,10 @@ def start(
     "model_name",
     type=str,
     required=True,
-    help="Model name from HuggingFace model hub",
+    help="Model name from HuggingFace model hub or a local model path",
 )
 @click.option("--backend", type=str, required=True, help="Backend")
-@click.option("--adapter-name", type=str, help="Name of the LoRA adapter")
+@click.option("--adapter-name", type=str, help="Name or path of the LoRA adapter")
 @click.option(
     "--tensor-parallel-size", type=int, default=1, help="Tensor parallel size"
 )
@@ -422,36 +481,91 @@ def save(
     try:
         if backend == "vllm":
             downloader = VllmModelDownloader()
-            storage_path = os.path.join(storage_path, "vllm")
+            vllm_storage_path = os.path.join(storage_path, "vllm")
             downloader.download_vllm_model(
                 model_name,
                 "float16",
                 tensor_parallel_size=tensor_parallel_size,
-                storage_path=storage_path,
+                storage_path=vllm_storage_path,
                 local_model_path=local_model_path,
             )
         elif backend == "transformers":
-            if adapter_name:
-                config = AutoConfig.from_pretrained(
-                    model_name,
-                    trust_remote_code=True,
+            # The model identifier is the Store key; local_model_path is the
+            # source directory. Never use an absolute source path as output.
+            output_identifier = adapter_name or model_name
+            model_path = _transformers_model_path(
+                storage_path, output_identifier
+            )
+            if os.path.lexists(model_path):
+                raise FileExistsError(
+                    f"Model output already exists; refusing to overwrite: {model_path}"
                 )
-                config.torch_dtype = torch.float16
-                module = importlib.import_module("transformers")
-                hf_model_cls = module.AutoModelForCausalLM
-                base_model = hf_model_cls.from_config(
-                    config,
-                    trust_remote_code=True,
-                ).to(config.torch_dtype)
-                model = PeftModel.from_pretrained(base_model, adapter_name)
-                model_path = os.path.join(storage_path, adapter_name)
-                save_lora(model, model_path)
-            else:
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_name, torch_dtype=torch.float16
+
+            model_source = local_model_path or model_name
+            source_candidate = Path(model_source).expanduser()
+            source_dir = None
+            if local_model_path is not None or source_candidate.is_dir():
+                source_dir = source_candidate.resolve(strict=True)
+                if not source_dir.is_dir():
+                    raise NotADirectoryError(
+                        f"Invalid model source directory: {source_dir}"
+                    )
+                model_source = str(source_dir)
+
+            # Reject both nesting directions to avoid writing any converted
+            # files into the source model tree (or replacing its parent).
+            resolved_output = model_path.resolve()
+            if source_dir is not None and (
+                source_dir == resolved_output
+                or source_dir in resolved_output.parents
+                or resolved_output in source_dir.parents
+            ):
+                raise ValueError(
+                    "Source model directory and output model directory must not overlap"
                 )
-                model_path = os.path.join(storage_path, model_name)
-                save_model(model, model_path)
+
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            # Stage the complete output on the same filesystem, then publish it
+            # atomically. A failed conversion leaves no partial target directory.
+            with TemporaryDirectory(
+                prefix=f".{model_path.name}.saving-",
+                dir=model_path.parent,
+            ) as temporary_dir:
+                staging_path = Path(temporary_dir) / "checkpoint"
+                staging_path.mkdir()
+
+                if adapter_name:
+                    config = AutoConfig.from_pretrained(
+                        model_source,
+                        trust_remote_code=True,
+                    )
+                    config.torch_dtype = torch.float16
+                    module = importlib.import_module("transformers")
+                    hf_model_cls = module.AutoModelForCausalLM
+                    base_model = hf_model_cls.from_config(
+                        config,
+                        trust_remote_code=True,
+                    ).to(config.torch_dtype)
+                    model = PeftModel.from_pretrained(base_model, adapter_name)
+                    save_lora(model, str(staging_path))
+                else:
+                    model = AutoModelForCausalLM.from_pretrained(
+                        model_source, torch_dtype=torch.float16
+                    )
+                    save_model(model, str(staging_path))
+
+                    # Keep tokenizer assets with the converted checkpoint.
+                    # This lets load-time example inference use the Store
+                    # directory instead of treating the Store key as an HF ID.
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        model_source,
+                        trust_remote_code=True,
+                    )
+                    tokenizer.save_pretrained(str(staging_path))
+
+                _publish_vllm_checkpoint(
+                    staging_path, storage_path, _transformers_output_name(output_identifier)
+                )
         else:
             logger.error(f"Unsupported backend '{backend}'")
             sys.exit(1)
@@ -547,9 +661,13 @@ def load(
             for i in range(num_gpus):
                 torch.ones(1).to(f"cuda:{i}")
                 torch.cuda.synchronize()
+            # A save invoked with an absolute local --model path stores under
+            # its basename. Resolve the same key when loading from Store.
+            store_model_name = _transformers_output_name(model_name)
             if adapter_name:
+                store_adapter_name = _transformers_output_name(adapter_name)
                 model = load_model(
-                    model_name,
+                    store_model_name,
                     device_map="auto",
                     torch_dtype=torch.float16,
                     storage_path=storage_path,
@@ -558,14 +676,14 @@ def load(
                 model = load_lora(
                     model,
                     adapter_name,
-                    adapter_path=adapter_name,
+                    adapter_path=store_adapter_name,
                     device_map="auto",
                     storage_path=storage_path,
                     torch_dtype=torch.float16,
                 )
             else:
                 model = load_model(
-                    model_name,
+                    store_model_name,
                     device_map="auto",
                     torch_dtype=torch.float16,
                     storage_path=storage_path,
@@ -580,6 +698,8 @@ def load(
                 model=model,
                 model_name=model_name,
                 adapter_name=adapter_name,
+                storage_path=storage_path,
+                store_model_name=store_model_name,
             )
         else:
             logger.error(f"Unsupported backend '{backend}'")
@@ -595,7 +715,14 @@ def load(
     )
 
 
-def example_inferences(backend, model=None, model_name=None, adapter_name=None):
+def example_inferences(
+    backend,
+    model=None,
+    model_name=None,
+    adapter_name=None,
+    storage_path=None,
+    store_model_name=None,
+):
     if backend == "vllm":
         prompts = [
             "Hello, my name is",
@@ -612,10 +739,39 @@ def example_inferences(backend, model=None, model_name=None, adapter_name=None):
             generated_text = output.outputs[0].text
             print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
     elif backend == "transformers":
-        parts = Path(model_name).parts
-        if len(parts) >= 2:
-            model_name = f"{parts[-2]}/{parts[-1]}"
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer_source = None
+        local_files_only = False
+
+        # Prefer tokenizer files saved alongside the converted Store model.
+        if storage_path is not None and store_model_name is not None:
+            stored_model_path = _transformers_model_path(
+                storage_path, store_model_name
+            )
+            if _has_tokenizer_files(stored_model_path):
+                tokenizer_source = str(stored_model_path)
+
+        # Backward compatibility: accept an explicitly supplied local source
+        # directory when it is still available.
+        source_candidate = Path(model_name).expanduser()
+        if tokenizer_source is None and source_candidate.is_dir():
+            tokenizer_source = str(source_candidate.resolve())
+
+        # If this is an HF namespace/repository ID, preserve the previous
+        # online fallback. A bare Store alias is checked locally only so it
+        # cannot trigger a network request such as huggingface.co/qwen7b.
+        if tokenizer_source is None:
+            tokenizer_source = model_name
+            local_files_only = (
+                "/" not in model_name
+                and not source_candidate.is_absolute()
+                and not source_candidate.is_dir()
+            )
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_source,
+            trust_remote_code=True,
+            local_files_only=local_files_only,
+        )
         inputs = tokenizer("Hello, my dog is cute", return_tensors="pt").to(
             "cuda"
         )
@@ -632,3 +788,4 @@ def example_inferences(backend, model=None, model_name=None, adapter_name=None):
 # Entry point for the 'sllm-store' CLI
 def main():
     cli()
+
