@@ -79,6 +79,59 @@ def _expand_tensor_name(
 
     return expanded_device_map
 
+def _get_no_split_modules_compat(model, device_map):
+    """Use legacy HF API if present; otherwise preserve its recursive semantics.
+
+    The fallback mirrors the Apache-2.0 Transformers PreTrainedModel traversal:
+    https://github.com/huggingface/transformers/blob/v4.57.1/src/transformers/modeling_utils.py
+    """
+    # Keep using the original Transformers API when available.
+    legacy = getattr(model, "_get_no_split_modules", None)
+    if callable(legacy):
+        return legacy(device_map)
+
+    # Transformers versions without _get_no_split_modules:
+    # recursively collect _no_split_modules from PreTrainedModel instances.
+    from transformers import PreTrainedModel
+
+    no_split = set()
+    pending = [model]
+    seen = set()
+
+    while pending:
+        module = pending.pop()
+
+        # Avoid visiting the same module multiple times.
+        if id(module) in seen:
+            continue
+        seen.add(id(module))
+
+        # Match the old API: an atomic block does not need child traversal.
+        if type(module).__name__ in no_split:
+            continue
+
+        if isinstance(module, PreTrainedModel):
+            names = getattr(module, "_no_split_modules", None)
+
+            if names is None:
+                raise ValueError(
+                    f"{type(module).__name__} does not declare "
+                    f"_no_split_modules for device_map={device_map!r}. "
+                    "Cannot safely infer placement."
+                )
+
+            if not isinstance(
+                names, (list, tuple, set, frozenset)
+            ) or not all(isinstance(name, str) for name in names):
+                raise TypeError(
+                    "_no_split_modules must be a collection of class names"
+                )
+
+            no_split.update(names)
+
+        pending.extend(module.children())
+
+    return sorted(no_split)
 
 def _compute_device_placement_from_map(
     model: torch.nn.Module,
@@ -91,7 +144,7 @@ def _compute_device_placement_from_map(
     """
 
     if isinstance(device_map, str):
-        no_split_modules = model._get_no_split_modules(device_map)
+        no_split_modules = _get_no_split_modules_compat(model, device_map)
         if device_map not in [
             "auto",
             "balanced",
